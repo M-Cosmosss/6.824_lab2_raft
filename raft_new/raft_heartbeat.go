@@ -5,45 +5,40 @@ import (
 	"time"
 )
 
+// checkHeartBeat 处于 follower 状态时，检测 leader 是否长时间无发送心跳
+// 认为 leader 离线时发起选举
 func (rf *Raft) checkHeartBeat() {
-	rf.log(fmt.Sprintf("checkHeartBeat start"))
+	rf.log("checkHeartBeat start")
 	for {
 		rf.mu.RLock()
 		for rf.state != follower {
 			rf.mu.RUnlock()
-			time.Sleep(heartBeat * time.Millisecond)
+			time.Sleep(heartBeatCheck)
 			rf.mu.RLock()
 		}
-		//rf.mu.RUnlock()
-		t := time.NewTimer(time.Millisecond * 10)
-		//rf.mu.RLock()
+		t := time.NewTimer(heartBeatRPCTimeout)
 		select {
 		case <-rf.heartBeatTimer.C:
 			if rf.state == leader {
 				rf.logWithoutLock("leader heart error")
-				panic("")
+				panic("leader heart error")
 			}
 			rf.changeRoleWithoutLock(candidate)
 			rf.updateTermWithoutLock()
 			rf.changeVotedForWithoutLock(rf.me)
-			rf.logWithoutLock(fmt.Sprintf("HeartBeat timeout"))
+			rf.logWithoutLock("HeartBeat timeout")
 			rf.mu.RUnlock()
 			rf.startVote()
 		case <-t.C:
-			//rf.logWithoutLock("HeartBeat Timer running")
 			rf.mu.RUnlock()
 		case <-rf.kill:
 			rf.mu.RUnlock()
 			return
-			//default:
-			//	rf.log(fmt.Sprintf("HeartBeat running"))
-			//	time.Sleep(heartBeat * time.Millisecond)
 		}
-		//return
-		//rf.heartBeatTimer = time.NewTimer(randHeartBeatTime())
 	}
 }
 
+// heartBeat 处于 leader 状态时，定期向所有 follower 发送心跳
 func (rf *Raft) heartBeat() {
 	for {
 		select {
@@ -51,7 +46,7 @@ func (rf *Raft) heartBeat() {
 			return
 		default:
 		}
-		time.Sleep(heartBeat * time.Millisecond)
+		time.Sleep(heartBeatCheck)
 		rf.mu.RLock()
 		if rf.state == leader {
 			rf.mu.RUnlock()
@@ -61,10 +56,11 @@ func (rf *Raft) heartBeat() {
 		rf.mu.RUnlock()
 	}
 }
+
+// broadcastHeartBeat 向所有 follower 发送心跳
 func (rf *Raft) broadcastHeartBeat(t int) {
 	rf.log("broadcastHeartBeat Start")
 
-	//ch := make(chan int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -73,7 +69,7 @@ func (rf *Raft) broadcastHeartBeat(t int) {
 		go func(i int, t int) {
 			rf.mu.RLock()
 			ch := make(chan bool, 1)
-			timer := time.NewTimer(heartBeat * time.Millisecond)
+			timer := time.NewTimer(heartBeatCheck)
 			if t != rf.currentTerm {
 				rf.logWithoutLock("broadcast cancel")
 				rf.mu.RUnlock()
@@ -114,8 +110,10 @@ func (rf *Raft) broadcastHeartBeat(t int) {
 	rf.log("broadcastHeartBeat Done")
 }
 
+// resetHeartBeatTimer 重置心跳超时定时器
 func (rf *Raft) resetHeartBeatTimer() {
 	if ok := rf.heartBeatTimer.Reset(rf.randHeartBeatTime()); !ok {
+		// 如果定时器已经触发，并且定时器管道中存在未被读取的信号，就将其移除
 		if len(rf.heartBeatTimer.C) > 0 {
 			<-rf.heartBeatTimer.C
 		}

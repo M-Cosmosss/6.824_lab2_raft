@@ -39,11 +39,12 @@ const (
 const (
 	timeOutBase             = 400
 	timeOutMaxRange         = 300
-	rpcTimeOut              = 200
 	electionTimeOutBase     = 100
 	electionTimeOutMaxRange = 300
-	heartBeat               = 100
-	doAppendEntriesTime     = 10
+	rpcTimeOut              = 200 * time.Millisecond
+	heartBeatCheck          = 100 * time.Millisecond
+	heartBeatRPCTimeout     = 10 * time.Millisecond
+	doAppendEntriesTime     = 10 * time.Millisecond
 )
 
 func init() {
@@ -90,19 +91,31 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state           int
-	currentTerm     int
-	votedFor        int
+	state int
+	// 当前任期
+	currentTerm int
+	// 当前任期选票投给了谁，-1代表未投
+	votedFor int
+	// 当前最新 log 序号
 	currentLogIndex int
-	commitIndex     int
-	lastApplied     int
-	heartBeatTimer  *time.Timer
-	logs            []*LogEntry
-	kill            chan struct{}
-	commitCh        chan int
-	applyCh         chan ApplyMsg
-	nextIndex       []int
-	matchIndex      []int
+	// 已提交 log 序号
+	commitIndex int
+	// 上一个应用的 log 序号
+	lastApplied int
+	// follower 状态下的心跳超时定时器
+	heartBeatTimer *time.Timer
+	// 日志
+	logs []*LogEntry
+	// 通过关闭 channel 来通知该 Raft 实例的所有协程退出
+	kill chan struct{}
+	// leader 状态下，用于接收统计 follower 日志复制成功信息
+	commitCh chan int
+	// 应用日志后通过该 channel 通知测试函数
+	applyCh chan ApplyMsg
+	// leader 状态下，用于统计各 follower 需要同步日志的进度
+	nextIndex []int
+	// leader 状态下，用于统计各 follower 已经同步日志的进度
+	matchIndex []int
 }
 
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
@@ -171,6 +184,7 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+// 日志
 type LogEntry struct {
 	Term    int
 	Command interface{}
@@ -201,37 +215,35 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    rf.currentTerm,
 			Command: command,
 		})
-		rf.logWithoutLock(fmt.Sprintf("Start: Index %d,command %d", rf.currentLogIndex, command))
+		rf.logWithoutLock("Start: Index %d,command %d", rf.currentLogIndex, command)
 		return rf.currentLogIndex, rf.currentTerm, true
-	} else {
-		return -1, -1, false
 	}
+	return -1, -1, false
 }
 
+// applyWorker 运行于单独的后台协程中，定期检测 commitIndex 是否大于 lastApplied，若大于则向 applyCh 发送应用日志，并更新前两者
 func (rf *Raft) applyWorker() {
 	for {
 		rf.mu.Lock()
 		if rf.commitIndex <= rf.lastApplied {
-			time.Sleep(doAppendEntriesTime * time.Millisecond)
+			time.Sleep(doAppendEntriesTime)
 			rf.mu.Unlock()
 			continue
 		}
 		if rf.lastApplied+1 > rf.currentLogIndex {
 			rf.logWithoutLock("[ERROR] applyWorker: race")
 			rf.mu.Unlock()
-			time.Sleep(doAppendEntriesTime * time.Millisecond)
+			time.Sleep(doAppendEntriesTime)
 			continue
-			//rf.log(fmt.Sprintf("rf.commitIndex: %d. rf.lastApplied: %d.",rf.commitIndex,rf.lastApplied))
-			//panic("")
 		}
 		msg := ApplyMsg{
 			CommandValid:  true,
-			Command:       rf.logs[rf.lastApplied+1].Command,
+			Command:       rf.logs[rf.lastApplied + 1].Command,
 			CommandIndex:  rf.lastApplied + 1,
 			SnapshotValid: false,
 		}
 		rf.lastApplied++
-		rf.logWithoutLock(fmt.Sprintf("applyWorker: apply index-%d", rf.lastApplied))
+		rf.logWithoutLock("applyWorker: apply index-%d", rf.lastApplied)
 		rf.applyCh <- msg
 		rf.mu.Unlock()
 	}
@@ -260,24 +272,10 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) log(str string) {
-	var s string
-	//rf.logWithoutLock("log: try get lock")
+func (rf *Raft) log(i ...interface{}) {
 	rf.mu.RLock()
-	switch rf.state {
-	case leader:
-		s = "leader   "
-	case follower:
-		s = "follower "
-	case candidate:
-		s = "candidate"
-	}
-	log.Printf("Node-%d-%d %s: "+str+"\n", rf.me, rf.currentTerm, s)
-	rf.mu.RUnlock()
-	//rf.logWithoutLock("log: unlock")
-}
-
-func (rf *Raft) logWithoutLock(str string) {
+	defer rf.mu.RUnlock()
+	str := fmt.Sprintf(i[0].(string), i[1:]...)
 	var s string
 	switch rf.state {
 	case leader:
@@ -290,14 +288,22 @@ func (rf *Raft) logWithoutLock(str string) {
 	log.Printf("Node-%d-%d %s: "+str+"\n", rf.me, rf.currentTerm, s)
 }
 
-func (rf *Raft) updateTermWithoutLock(i ...int) {
-	if len(i) == 0 {
-		rf.currentTerm++
-	} else {
-		rf.currentTerm = i[0]
+func (rf *Raft) logWithoutLock(i ...interface{}) {
+	str := fmt.Sprintf(i[0].(string), i[1:]...)
+	var s string
+	switch rf.state {
+	case leader:
+		s = "leader   "
+	case follower:
+		s = "follower "
+	case candidate:
+		s = "candidate"
 	}
-	rf.votedFor = -1
+	log.Printf("Node-%d-%d %s: "+str+"\n", rf.me, rf.currentTerm, s)
 }
+
+// updateTerm 更新任期，默认+=1，若入参存在就更新为入参值
+// 将投票去向重置为无
 func (rf *Raft) updateTerm(i ...int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -309,6 +315,16 @@ func (rf *Raft) updateTerm(i ...int) {
 	rf.votedFor = -1
 }
 
+func (rf *Raft) updateTermWithoutLock(i ...int) {
+	if len(i) == 0 {
+		rf.currentTerm++
+	} else {
+		rf.currentTerm = i[0]
+	}
+	rf.votedFor = -1
+}
+
+// changeVotedFor 更新投票去向
 func (rf *Raft) changeVotedFor(i int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -319,26 +335,22 @@ func (rf *Raft) changeVotedForWithoutLock(i int) {
 	rf.votedFor = i
 }
 
+// randHeartBeatTime 用于生成随机的心跳超时定时器时间
 func (rf *Raft) randHeartBeatTime() time.Duration {
 	n := timeOutBase + rand.Intn(timeOutMaxRange)
-	rf.logWithoutLock(fmt.Sprintf("rand time %d", n))
+	rf.logWithoutLock("rand time %d", n)
 	return time.Duration(n) * time.Millisecond
 }
 
+// randElectionTime 用于生成随机的选举超时定时器时间
 func (rf *Raft) randElectionTime() time.Duration {
 	n := electionTimeOutBase + rand.Intn(electionTimeOutMaxRange)
-	rf.logWithoutLock(fmt.Sprintf("rand election time %d", n))
+	rf.logWithoutLock("rand election time %d", n)
 	return time.Duration(n) * time.Millisecond
 }
 
-func (rf *Raft) changeRoleWithoutLock(r int) {
-	prev := rf.state
-	rf.state = r
-	if r == follower && prev != follower {
-		rf.resetHeartBeatTimer()
-	}
-}
-
+// changeRole 更改 Raft 实例的职责状态
+// 当从非 follower 状态变为 follower 状态时，需要重置心跳超时计时器
 func (rf *Raft) changeRole(r int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -349,12 +361,24 @@ func (rf *Raft) changeRole(r int) {
 	}
 }
 
+func (rf *Raft) changeRoleWithoutLock(r int) {
+	prev := rf.state
+	rf.state = r
+	if r == follower && prev != follower {
+		rf.resetHeartBeatTimer()
+	}
+}
+
+
 func (rf *Raft) updateCommitIndex(i int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.commitIndex = i
 }
 
+// commitWatcher 在 leader 状态下通过 commitCh 统计各 follower 的日志复制成功情况
+// 当有过半的 follower 已经复制成功日志时，将该日志视为已提交
+// 退出 leader 状态时，重置用于统计的 map
 func (rf *Raft) commitWatcher() {
 	m := make(map[int]int)
 	half := len(rf.peers) / 2
@@ -368,19 +392,19 @@ func (rf *Raft) commitWatcher() {
 			}
 			if m[index] != -1 {
 				m[index]++
-				rf.log(fmt.Sprintf("commitWatcher: %d++ now %d", index, m[index]))
+				rf.log("commitWatcher: %d++ now %d", index, m[index])
 			} else {
-				rf.log(fmt.Sprintf("commitWatcher: committed %d++", index))
+				rf.log("commitWatcher: committed %d++", index)
 			}
 			if m[index] >= half {
 				if rf.commitIndex > index {
 					m[index] = -1
-					rf.log(fmt.Sprintf("commitWatcher: commit older %d", index))
+					rf.log("commitWatcher: commit older %d", index)
 					continue
 				}
 				rf.updateCommitIndex(index)
 				m[index] = -1
-				rf.log(fmt.Sprintf("commitWatcher: commit %d", index))
+				rf.log("commitWatcher: commit %d", index)
 			}
 		case <-rf.kill:
 			return

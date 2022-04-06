@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -27,53 +26,58 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
+
+// RequestVote 请求选票 RPC 函数，满足指定的条件后才能向对方投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	// 如果请求的任期大于自身，就更新自身任期并重置 VotedFor
 	if args.Term > rf.currentTerm {
 		rf.updateTermWithoutLock(args.Term)
 		rf.changeRoleWithoutLock(follower)
-		rf.logWithoutLock(fmt.Sprintf("RequestVote: find bigger term from Node-%d", args.CandidateID))
+		rf.logWithoutLock("RequestVote: find bigger term from Node-%d", args.CandidateID)
 	}
+	// 如果自身已经将选票投给了对方以外的人，或者对方的任期低于自己，就返回失败
 	if (rf.votedFor != -1 && rf.votedFor != args.CandidateID) || args.Term < rf.currentTerm {
-		rf.logWithoutLock(fmt.Sprintf("RPC RequestVote fail:Candidate-%d.VotedFor: %d", args.CandidateID, rf.votedFor))
+		rf.logWithoutLock("RPC RequestVote fail:Candidate-%d.VotedFor: %d", args.CandidateID, rf.votedFor)
 		reply.VoteGranted = false
 		return
 	}
+	// 如果对方的日志落后于自己，就返回失败
 	if args.LastLogTerm < rf.logs[rf.currentLogIndex].Term || (args.LastLogTerm == rf.logs[rf.currentLogIndex].Term && args.LastLogIndex < rf.currentLogIndex) {
 		reply.VoteGranted = false
-		rf.logWithoutLock(fmt.Sprintf("RPC RequestVote fail 5.4:Candidate-%d.", args.CandidateID))
+		rf.logWithoutLock("RPC RequestVote fail 5.4:Candidate-%d.", args.CandidateID)
 		return
 	}
-	rf.logWithoutLock(fmt.Sprintf("RPC RequestVote success:Candidate-%d.\n"+
+	rf.logWithoutLock("RPC RequestVote success:Candidate-%d.\n"+
 		"args.LastLogTerm: %d. rf.logs[rf.currentLogIndex].Term: %d. rf.currentLogIndex: %d", args.CandidateID, args.LastLogTerm, rf.logs[rf.currentLogIndex].Term,
-		rf.currentLogIndex))
+		rf.currentLogIndex)
+	// 符合条件，投票给对方
 	reply.VoteGranted = true
 	rf.changeVotedForWithoutLock(args.CandidateID)
 
+	//　需要重置心跳超时计时器，防止刚投票出去自身就计时器触发变为了任期更大的 candidate
 	rf.resetHeartBeatTimer()
 	return
 }
 
+// startVote 开始选举，向所有 Raft 节点请求投票
 func (rf *Raft) startVote() {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	rf.log(fmt.Sprintf("start vote"))
+	rf.log("start vote")
 
 	peerNums := len(rf.peers)
 	for {
-		timer := time.NewTimer(rpcTimeOut * time.Millisecond)
+		timer := time.NewTimer(rpcTimeOut)
+		// 已获得的选票与选举成功需要的票数
 		acquiredVotes, neededVotes := 1, peerNums/2+1
 		ch := make(chan bool, peerNums-1)
 		for i := 0; i < peerNums; i++ {
 			if i == rf.me {
 				continue
 			}
+			// 起协程向节点 i 发起 RPC 请求投票，用 channel 返回结果
 			go rf.doVote(ch, i)
 		}
 		for i := 0; i < peerNums-1; i++ {
@@ -81,27 +85,30 @@ func (rf *Raft) startVote() {
 			case result := <-ch:
 				rf.mu.Lock()
 				if result {
-					rf.logWithoutLock(fmt.Sprintf("acquiredVotes++"))
+					rf.logWithoutLock("acquiredVotes++")
 					acquiredVotes++
 				}
+				// 检测到自身不再是 candidate 时退出
 				if rf.state != candidate {
 					rf.logWithoutLock("stop vote for become follower")
 					rf.mu.Unlock()
 					return
 				}
 				if acquiredVotes >= neededVotes {
-					rf.logWithoutLock(fmt.Sprintf("become leader"))
+					rf.logWithoutLock("become leader")
 					rf.changeRoleWithoutLock(leader)
+					// 初始化每个 follower 对应的 nextIndex 与 matchIndex
 					for i2 := range rf.nextIndex {
-						//rf.nextIndex[i2] = rf.commitIndex + 1
 						rf.nextIndex[i2] = rf.currentLogIndex + 1
 					}
 					for i2 := range rf.matchIndex {
 						rf.matchIndex[i2] = 0
 					}
+					// 防止出现发起心跳时任期已经改变的情况，使用现在的任期进行心跳广播
 					t := rf.currentTerm
 					rf.mu.Unlock()
 					rf.broadcastHeartBeat(t)
+					// 启动日志分发
 					go rf.startAppendEntries()
 					return
 				}
@@ -112,6 +119,7 @@ func (rf *Raft) startVote() {
 			}
 		}
 	TIMEOUT:
+		// 使用随机的选举超时时间休眠，防止多个 candidate 一直竞争选票
 		time.Sleep(rf.randElectionTime())
 		rf.mu.Lock()
 		if rf.state != candidate {
@@ -131,6 +139,7 @@ func (rf *Raft) startVote() {
 	}
 }
 
+// doVote 异步地发起请求选票 RPC，通过 channel 返回结果
 func (rf *Raft) doVote(ch chan bool, index int) {
 	rf.mu.RLock()
 	args := &RequestVoteArgs{
@@ -141,9 +150,9 @@ func (rf *Raft) doVote(ch chan bool, index int) {
 	}
 	rf.mu.RUnlock()
 	reply := &RequestVoteReply{}
-	rf.log(fmt.Sprintf("doVote to Node-%d", index))
+	rf.log("doVote to Node-%d", index)
 	if ok := rf.sendRequestVote(index, args, reply); !ok {
-		rf.log(fmt.Sprintf("RequestVote Error: server %d.", index))
+		rf.log("RequestVote Error: server %d.", index)
 		ch <- false
 		return
 	}
@@ -151,9 +160,9 @@ func (rf *Raft) doVote(ch chan bool, index int) {
 	if reply.Term > rf.currentTerm {
 		rf.updateTermWithoutLock(reply.Term)
 		rf.changeRoleWithoutLock(follower)
-		rf.logWithoutLock(fmt.Sprintf("doVote: find bigger term from Node-%d", index))
+		rf.logWithoutLock("doVote: find bigger term from Node-%d", index)
 	}
-	rf.logWithoutLock(fmt.Sprintf("RequestVote: server %d %t.", index, reply.VoteGranted))
+	rf.logWithoutLock("RequestVote: server %d %t.", index, reply.VoteGranted)
 	ch <- reply.VoteGranted
 	rf.mu.Unlock()
 	return
